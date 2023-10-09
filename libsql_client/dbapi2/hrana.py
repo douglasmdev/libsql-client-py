@@ -136,7 +136,7 @@ def _get_aiohttp_client_error_code(
 def _conv_stmt_result(
     result: Optional[StmtResult],
     error: Optional[BaseException],
-) -> RawExecuteResult:
+) -> asyncio.Future[RawExecuteResult]:
     if isinstance(error, aiohttp.ClientError):
         code, name = _get_aiohttp_client_error_code(error)
         error = OperationalError(str(error))
@@ -144,7 +144,9 @@ def _conv_stmt_result(
             error.sqlite_errorcode = code  # type: ignore
             error.sqlite_errorname = name  # type: ignore
 
-    return RawExecuteResult([result], [error])
+    fut: asyncio.Future[RawExecuteResult] = asyncio.Future()
+    fut.set_result(RawExecuteResult([result], [error]))
+    return fut
 
 
 def _conv_batch(stmts: List[Stmt]) -> Batch:
@@ -305,8 +307,7 @@ class ConnectionHrana(Connection):
         self._inf("closing stream: %s", stream)
         stream.close()
 
-    @run_in_executor
-    def _raw_execute(self, stmt: Stmt) -> asyncio.Future[StmtResult]:
+    async def _raw_execute(self, stmt: Stmt) -> asyncio.Future[StmtResult]:
         assert self._stream is not None
         return self._stream.execute(stmt)
 
@@ -361,11 +362,11 @@ class CursorHrana(Cursor):
 
     connection: ConnectionHrana
 
-    def _raw_execute_one(self, stmt: Stmt) -> RawExecuteResult:
+    async def _raw_execute_one(self, stmt: Stmt) -> asyncio.Future[RawExecuteResult]:
         try:
             if self.connection._trace_callback is not None:
                 self.connection._trace(stmt["sql"])
-            result = self.connection._raw_execute(stmt)
+            result = await self.connection._raw_execute(stmt)
             return _conv_stmt_result(result, None)
         except Exception as error:
             return _conv_stmt_result(None, error)
@@ -395,16 +396,16 @@ class CursorHrana(Cursor):
                 except Exception:
                     pass
 
-    def _raw_execute(
+    async def _raw_execute(
         self,
         sql: str,
         parameters: Iterable[SqlParameters],
         *,
         want_rows: bool = True,
-    ) -> RawExecuteResult:
+    ) -> asyncio.Future[RawExecuteResult]:
         stmts = _conv_stmts(sql, parameters, want_rows)
         if len(stmts) == 1:
-            return self._raw_execute_one(stmts[0])
+            return await self._raw_execute_one(stmts[0])
         elif len(stmts) > 1:
             return self._raw_execute_multiple(stmts)
         else:
