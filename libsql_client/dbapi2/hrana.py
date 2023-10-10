@@ -18,7 +18,6 @@ from typing import TypeVar
 import aiohttp
 from typing_extensions import ParamSpec
 
-from ._async_executor import AsyncExecutor
 from .types import Autocommit
 from .types import Connection
 from .types import Cursor
@@ -175,56 +174,12 @@ def _conv_batch_result(resp: BatchResult) -> RawExecuteResult:
     errors = [conv_err(e) for e in resp["step_errors"]]
     return RawExecuteResult(resp["step_results"], errors)
 
-
-if TYPE_CHECKING:
-    if sys.version_info[:2] >= (3, 9):
-
-        @overload
-        def run_in_executor(
-            fn: Callable[P, Awaitable[asyncio.Future[T]]],
-        ) -> Callable[P, T]:
-            ...
-
-    @overload
-    def run_in_executor(fn: Callable[P, Awaitable[T]]) -> Callable[P, T]:
-        ...
-
-    @overload
-    def run_in_executor(fn: Callable[P, T]) -> Callable[P, T]:
-        ...
-
-
-def run_in_executor(fn: Callable[P, T]) -> Callable[P, T]:
-    """ConnectionHrana method decorator that runs code in the executor thread.
-
-    This will execute the decorated method body inside the
-    :py:class:`AsyncExecutor` thread by doing a ``AsyncExecutor.submit()``
-    and then ``future.result(timeout)``.
-
-    The method itself will block until the executor runs.
-
-    :meta private:
-    """
-
-    def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
-        self = args[0]
-        assert isinstance(self, ConnectionHrana)
-        assert self._executor is not None
-
-        future = self._executor.submit(fn, *args, **kwargs)
-
-        return future.result(timeout=self._timeout)
-
-    return wrapper
-
-
 class ConnectionHrana(Connection):
     """Implement :py:class:`sqlite3.Connection` for remote servers
     using the `Hrana Protocol
     <https://github.com/libsql/sqld/blob/main/docs/HRANA_2_SPEC.md>`_.
     """
 
-    _executor: Optional[AsyncExecutor]  # TODO: share
     _session: Optional[aiohttp.ClientSession]  # TODO: share (per url)
     _conn: Optional[HranaConn]  # TODO: share (per url)
     _stream: Optional[HranaStream]
@@ -255,7 +210,6 @@ class ConnectionHrana(Connection):
     def _raw_init(self) -> None:
         self.cursor_factory = CursorHrana
         try:
-            self._executor = self._acquire_executor()
             self._session = self._acquire_session()
             self._conn = self._acquire_connection(self._database)
             self._stream = self._create_stream()
@@ -263,46 +217,25 @@ class ConnectionHrana(Connection):
             self._raw_close()
             raise
 
-    def _acquire_executor(self) -> AsyncExecutor:
-        return AsyncExecutor()  # TODO: share
-
-    def _dispose_executor(self, executor: AsyncExecutor) -> None:
-        executor.shutdown()  # TODO: share
-
-    @run_in_executor
     def _acquire_session(self) -> aiohttp.ClientSession:
         return aiohttp.ClientSession()  # TODO: share
 
-    @run_in_executor
     async def _dispose_session(self, session: aiohttp.ClientSession) -> None:
         await session.close()  # TODO: share
 
-    @run_in_executor
-    async def _acquire_connection(self, url: str) -> HranaConn:
+    def _acquire_connection(self, url: str) -> HranaConn:
         assert self._session is not None
-        # TODO: share (per url)
-        conn = _create_hrana_connection(self._session, url)
-        try:
-            await conn.wait_connected()
-            return conn
-        except Exception as error:
-            await conn.close()
-            exc = _conv_stmt_result(None, error).errors[0]
-            assert exc is not None  # make mypy happy
-            raise exc
+        return _create_hrana_connection(self._session, url)
 
-    @run_in_executor
     async def _dispose_connection(self, conn: HranaConn) -> None:
         await conn.close()  # TODO: share (per url)
 
-    @run_in_executor
     def _create_stream(self) -> HranaStream:
         assert self._conn is not None
         stream = self._conn.open_stream()
         self._inf("created stream: %s", stream)
         return stream
 
-    @run_in_executor
     def _destroy_stream(self, stream: HranaStream) -> None:
         self._inf("closing stream: %s", stream)
         stream.close()
@@ -311,27 +244,26 @@ class ConnectionHrana(Connection):
         assert self._stream is not None
         return self._stream.execute(stmt)
 
-    @run_in_executor
     def _raw_store_sql(self, sql: str) -> int:
         assert self._conn is not None
         return self._conn.store_sql(sql)
 
-    @run_in_executor
     def _raw_close_sql(self, sql_id: int) -> None:
         assert self._conn is not None
         return self._conn.close_sql(sql_id)
 
-    @run_in_executor
     def _raw_execute_script(self, sql_script: str) -> asyncio.Future[None]:
         assert self._stream is not None
         return self._stream.sequence(sql_script)
 
-    @run_in_executor
     def _raw_batch(self, batch: Batch) -> asyncio.Future[BatchResult]:
         assert self._stream is not None
         return self._stream.batch(batch)
 
     def _raw_close(self) -> None:
+        asyncio.create_task(self._cleanup())
+
+    async def _cleanup(self) -> None:
         # use of getattr as the object may fail init
         stream = getattr(self, "_stream", None)
         if stream is not None:
@@ -340,18 +272,14 @@ class ConnectionHrana(Connection):
 
         conn = getattr(self, "_conn", None)
         if conn is not None:
-            self._dispose_connection(conn)
+            await self._dispose_connection(conn)
             self._conn = None
 
         session = getattr(self, "_session", None)
         if session is not None:
-            self._dispose_session(session)
+            await self._dispose_session(session)
             self._session = None
 
-        executor = getattr(self, "_executor", None)
-        if executor is not None:
-            self._dispose_executor(executor)
-            self._executor = None
 
 
 class CursorHrana(Cursor):
