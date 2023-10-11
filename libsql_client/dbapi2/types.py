@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from abc import ABCMeta
 from abc import abstractmethod
 import collections
@@ -548,16 +549,16 @@ class Connection(metaclass=ABCMeta):
     def _get_statement(self, sql: str) -> Statement:
         return self._cached_statement_getter(sql)
 
-    def _begin_transaction(self) -> None:
+    async def _begin_transaction(self) -> None:
         # see begin_transaction()
         # https://github.com/python/cpython/blob/main/Modules/_sqlite/cursor.c#L476
         assert self.isolation_level is not None
-        self.cursor()._query_execute(
+        await self.cursor()._query_execute(
             f"BEGIN {self.isolation_level}",
             want_rows=False,
         )
 
-    def _begin_transaction_if_needed(self, statement: Statement) -> None:
+    async def _begin_transaction_if_needed(self, statement: Statement) -> None:
         # _pysqlite_query_execute()
         # https://github.com/python/cpython/blob/main/Modules/_sqlite/cursor.c#L867-L877
         if (
@@ -566,7 +567,7 @@ class Connection(metaclass=ABCMeta):
             and statement.is_dml
             and self._sqlite3_get_autocommit()
         ):
-            self._begin_transaction()
+            await self._begin_transaction()
 
     _begin_transaction_tokens: ClassVar[Set[str]] = {"BEGIN"}
     _end_transaction_tokens: ClassVar[Set[str]] = {"END", "COMMIT", "ROLLBACK"}
@@ -581,13 +582,13 @@ class Connection(metaclass=ABCMeta):
 
     @check_thread
     @check_connection
-    def commit(self) -> None:
+    async def commit(self) -> None:
         "See :py:meth:`sqlite3.Connection.commit`"
         # See pysqlite_connection_commit_impl()
         # https://github.com/python/cpython/blob/main/Modules/_sqlite/connection.c#L634
         if self._autocommit is LEGACY_TRANSACTION_CONTROL:
             if not self._sqlite3_get_autocommit():
-                self.cursor()._query_execute("COMMIT", want_rows=False)
+                await self.cursor()._query_execute("COMMIT", want_rows=False)
         elif self._autocommit is False:
             c = self.cursor()
             c._query_execute("COMMIT", want_rows=False)
@@ -630,13 +631,13 @@ class Connection(metaclass=ABCMeta):
         "Does nothing"
         pass
 
-    def execute(
+    async def execute(
         self,
         sql: str,
         parameters: SqlParameters = (),
-    ) -> "Cursor":
+    ) -> asyncio.Future["Cursor"]:
         "See :py:meth:`sqlite3.Connection.execute`"
-        return self.cursor().execute(sql, parameters)
+        return await self.cursor().execute(sql, parameters)
 
     def executemany(
         self,
@@ -1137,13 +1138,13 @@ class Cursor(metaclass=ABCMeta):
         return self._rowcount
 
     @abstractmethod
-    def _raw_execute(
+    async def _raw_execute(
         self,
         sql: str,
         parameters: Iterable[SqlParameters],
         *,
         want_rows: bool = True,
-    ) -> RawExecuteResult:
+    ) -> asyncio.Future[RawExecuteResult]:
         # each system should implement this one
         raise NotImplementedError()
 
@@ -1295,19 +1296,21 @@ class Cursor(metaclass=ABCMeta):
         return parameters
 
     @check_cursor
-    def _query_execute(
+    async def _query_execute(
         self,
         sql: str,
         parameters: Iterable[SqlParameters] = ((),),
         *,
         multiple: bool = False,
         want_rows: bool = True,
-    ) -> Self:
+    ) -> asyncio.Future[Self]:
+        fut: asyncio.Future[Self] = asyncio.Future()
         if not isinstance(sql, str):
             # required by test CursorTests.test_execute_many_wrong_sql_arg()
             raise TypeError("sql must be a str")
         if not sql:
-            return self
+            fut.set_result(self)
+            return fut
 
         params = tuple(self._adapt_params(p) for p in parameters)
 
@@ -1320,7 +1323,7 @@ class Cursor(metaclass=ABCMeta):
                 msg = "executemany() can only execute DML statements."
                 raise ProgrammingError(msg)
             self._reset_result(statement)
-            self._connection._begin_transaction_if_needed(statement)
+            await self._connection._begin_transaction_if_needed(statement)
 
             # Locking is not that meaningful with libsql_client since
             # we don't callback to python during execution as done by
@@ -1328,7 +1331,7 @@ class Cursor(metaclass=ABCMeta):
             # NOTE: _begin_transaction_if_needed() will call this function
             # so do not lock before this point!
             self._locked = True
-            self._raw_results = self._raw_execute(
+            self._raw_results = await self._raw_execute(
                 sql,
                 params,
                 want_rows=want_rows,
@@ -1341,22 +1344,25 @@ class Cursor(metaclass=ABCMeta):
                 self._apply_raw_results(result)
 
             self._connection._update_in_transaction(statement)
-            return self
+            fut.set_result(self)
+            return fut
         finally:
             self._locked = False
 
-    def execute(
+    async def execute(
         self,
         sql: str,
         parameters: SqlParameters = (),
-    ) -> Self:
+    ) -> asyncio.Future[Self]:
+        fut: asyncio.Future[Self] = asyncio.Future()
         "See :py:meth:`sqlite3.Cursor.execute`"
         if not isinstance(parameters, collections.abc.Mapping) and not (
             hasattr(parameters, "__len__") and hasattr(parameters, "__getitem__")
         ):
             raise ProgrammingError("parameters are of unsupported type")
-        self._query_execute(sql, (parameters,), multiple=False, want_rows=True)
-        return self
+        await self._query_execute(sql, (parameters,), multiple=False, want_rows=True)
+        fut.set_result(self)
+        return fut
 
     def executemany(
         self,
